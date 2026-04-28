@@ -1,5 +1,6 @@
 from collections import namedtuple
 
+from dictionary_learning.dictionary_learning.trainers.jumprelu import JumpReLUFunction, StepFunction
 import torch
 import torch.autograd as autograd
 from torch import nn
@@ -7,69 +8,16 @@ from typing import Optional
 
 from ..dictionary import Dictionary, JumpReluAutoEncoder
 from ..trainers.trainer import (
-    SAETrainer,
     get_lr_schedule,
     get_sparsity_warmup_fn,
     set_decoder_norm_to_unit_norm,
     remove_gradient_parallel_to_decoder_directions,
 )
+from ..trainers.jumprelu import JumpReluTrainer
 
-
-class RectangleFunction(autograd.Function):
-    @staticmethod
-    def forward(ctx, x):
-        ctx.save_for_backward(x)
-        return ((x > -0.5) & (x < 0.5)).float()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        (x,) = ctx.saved_tensors
-        grad_input = grad_output.clone()
-        grad_input[(x <= -0.5) | (x >= 0.5)] = 0
-        return grad_input
-
-
-class JumpReLUFunction(autograd.Function):
-    @staticmethod
-    def forward(ctx, x, threshold, bandwidth):
-        ctx.save_for_backward(x, threshold, torch.tensor(bandwidth))
-        return x * (x > threshold).float()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, threshold, bandwidth_tensor = ctx.saved_tensors
-        bandwidth = bandwidth_tensor.item()
-        x_grad = (x > threshold).float() * grad_output
-        threshold_grad = (
-            -(threshold / bandwidth)
-            * RectangleFunction.apply((x - threshold) / bandwidth)
-            * grad_output
-        )
-        return x_grad, threshold_grad, None  # None for bandwidth
-
-
-class StepFunction(autograd.Function):
-    @staticmethod
-    def forward(ctx, x, threshold, bandwidth):
-        ctx.save_for_backward(x, threshold, torch.tensor(bandwidth))
-        return (x > threshold).float()
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        x, threshold, bandwidth_tensor = ctx.saved_tensors
-        bandwidth = bandwidth_tensor.item()
-        x_grad = torch.zeros_like(x)
-        threshold_grad = (
-            -(1.0 / bandwidth) * RectangleFunction.apply((x - threshold) / bandwidth) * grad_output
-        )
-        return x_grad, threshold_grad, None  # None for bandwidth
-
-
-class JumpReluTrainer(nn.Module, SAETrainer):
+class IdempotentTrainer(JumpReluTrainer):
     """
-    Trains a JumpReLU autoencoder.
-
-    Note does not use learning rate or sparsity scheduling as in the paper.
+    Trains an idempotent autoencoder.
     """
 
     def __init__(
@@ -85,64 +33,35 @@ class JumpReluTrainer(nn.Module, SAETrainer):
         lr: float = 7e-5,
         bandwidth: float = 0.001,
         sparsity_penalty: float = 1.0,
+        idempotency_penalty: float = 1.0,
         warmup_steps: int = 1000,  # lr warmup period at start of training and after each resample
         sparsity_warmup_steps: Optional[int] = 2000,  # sparsity warmup period at start of training
         decay_start: Optional[int] = None,  # decay learning rate after this many steps
         target_l0: float = 20.0,
         device: str = "cpu",
-        wandb_name: str = "JumpRelu",
+        wandb_name: str = "Idempotent",
         submodule_name: Optional[str] = None,
     ):
-        super().__init__()
-
-        # TODO: Should just be args, and this should be commonised
-        assert layer is not None, "Layer must be specified"
-        assert lm_name is not None, "Language model name must be specified"
-        self.lm_name = lm_name
-        self.layer = layer
-        self.submodule_name = submodule_name
-        self.device = device
-        self.steps = steps
-        self.lr = lr
-        self.seed = seed
-
-        self.bandwidth = bandwidth
-        self.sparsity_coefficient = sparsity_penalty
-        self.warmup_steps = warmup_steps
-        self.sparsity_warmup_steps = sparsity_warmup_steps
-        self.decay_start = decay_start
-        self.target_l0 = target_l0
-
-        # TODO: Better auto-naming (e.g. in BatchTopK package)
-        self.wandb_name = wandb_name
-
-        # TODO: Why not just pass in the initialised autoencoder instead?
-        self.ae = dict_class(
-            activation_dim=activation_dim,
-            dict_size=dict_size,
-            device=device,
-        ).to(self.device)
-
-        # Parameters from the paper
-        self.optimizer = torch.optim.Adam(self.ae.parameters(), lr=lr, betas=(0.0, 0.999), eps=1e-8)
-
-        lr_fn = get_lr_schedule(
-            steps,
-            warmup_steps,
-            decay_start,
-            resample_steps=None,
-            sparsity_warmup_steps=sparsity_warmup_steps,
+        super().__init__(
+            steps, 
+            activation_dim, 
+            dict_size, 
+            layer, 
+            lm_name, 
+            dict_class, 
+            seed, 
+            lr, 
+            bandwidth, 
+            sparsity_penalty, 
+            warmup_steps, 
+            sparsity_warmup_steps, 
+            decay_start, 
+            target_l0, 
+            device, 
+            wandb_name, 
+            submodule_name
         )
-
-        self.scheduler = torch.optim.lr_scheduler.LambdaLR(self.optimizer, lr_lambda=lr_fn)
-
-        self.sparsity_warmup_fn = get_sparsity_warmup_fn(steps, sparsity_warmup_steps)
-
-        # Purely for logging purposes
-        self.dead_feature_threshold = 10_000_000
-        self.num_tokens_since_fired = torch.zeros(dict_size, dtype=torch.long, device=device)
-        self.dead_features = -1
-        self.logging_parameters = ["dead_features"]
+        self.idempotency_coefficient = idempotency_penalty
 
     def loss(self, x: torch.Tensor, step: int, logging=False, **_):
         # Note: We are using threshold, not log_threshold as in this notebook:
@@ -167,52 +86,45 @@ class JumpReluTrainer(nn.Module, SAETrainer):
         recon = self.ae.decode(f)
 
         recon_loss = (x - recon).pow(2).sum(dim=-1).mean()
-        l0 = StepFunction.apply(f, self.ae.threshold, self.bandwidth).sum(dim=-1).mean()
+
+        active_features = StepFunction.apply(f, self.ae.threshold, self.bandwidth)
+        l0 = active_features.sum(dim=-1).mean()
 
         sparsity_loss = (
             self.sparsity_coefficient * ((l0 / self.target_l0) - 1).pow(2) * sparsity_scale
         )
-        loss = recon_loss + sparsity_loss
+
+        pre_jump_recon = recon @ self.ae.W_enc + self.ae.b_enc
+        f_recon = JumpReLUFunction.apply(pre_jump_recon, self.ae.threshold, self.bandwidth)
+        active_features_recon = StepFunction.apply(f_recon, self.ae.threshold, self.bandwidth)
+
+        intersection = (active_features * active_features_recon).sum(dim=-1).mean()
+        idempotency_loss = (
+            - self.idempotency_coefficient * intersection / self.target_l0
+        )
+
+        loss = recon_loss + sparsity_loss + idempotency_loss
 
         if not logging:
             return loss
         else:
+            iou_score = iou(active_features > 0, active_features_recon > 0)
             return namedtuple("LossLog", ["x", "recon", "f", "losses"])(
                 x,
                 recon,
                 f,
                 {
                     "l2_loss": recon_loss.item(),
+                    "idempotency_loss": idempotency_loss.item(),
+                    "iou": iou_score,
                     "loss": loss.item(),
                 },
             )
 
-    def update(self, step, x):
-        x = x.to(self.device)
-        loss = self.loss(x, step=step)
-        loss.backward()
-
-        # We must transpose because we are using nn.Parameter, not nn.Linear
-        self.ae.W_dec.grad = remove_gradient_parallel_to_decoder_directions(
-            self.ae.W_dec.T, self.ae.W_dec.grad.T, self.ae.activation_dim, self.ae.dict_size
-        ).T
-        torch.nn.utils.clip_grad_norm_(self.ae.parameters(), 1.0)
-
-        self.optimizer.step()
-        self.scheduler.step()
-        self.optimizer.zero_grad()
-
-        # We must transpose because we are using nn.Parameter, not nn.Linear
-        self.ae.W_dec.data = set_decoder_norm_to_unit_norm(
-            self.ae.W_dec.T, self.ae.activation_dim, self.ae.dict_size
-        ).T
-
-        return loss.item()
-
     @property
     def config(self):
         return {
-            "trainer_class": "JumpReluTrainer",
+            "trainer_class": "IdempotentTrainer",
             "dict_class": "JumpReluAutoEncoder",
             "lr": self.lr,
             "steps": self.steps,
@@ -226,6 +138,12 @@ class JumpReluTrainer(nn.Module, SAETrainer):
             "submodule_name": self.submodule_name,
             "bandwidth": self.bandwidth,
             "sparsity_penalty": self.sparsity_coefficient,
+            "idempotency_penalty": self.idempotency_coefficient,
             "sparsity_warmup_steps": self.sparsity_warmup_steps,
             "target_l0": self.target_l0,
         }
+
+def iou(a: torch.Tensor, b: torch.Tensor) -> float:
+    a = a.bool() # no-op if already of the correct type
+    b = b.bool()
+    return ((a * b).sum(dim=-1) / (a + b).sum(dim=-1).clamp_min(1)).mean().detach().cpu().item()
